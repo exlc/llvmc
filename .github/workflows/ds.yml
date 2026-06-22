@@ -1,48 +1,366 @@
-name: Calculate AOSP LLVM Revision (Corrected)
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║            AOSP LLVM Revision Calculator — GitHub Actions Workflow       ║
+# ╠══════════════════════════════════════════════════════════════════════════╣
+# ║  Computes the AOSP-style revision number for a hybrid LLVM fork,         ║
+# ║  following Android's "r<N>" toolchain convention (e.g. llvm r584948).    ║
+# ║                                                                           ║
+# ║  Three-strategy calculation:                                              ║
+# ║    A. SVN+Git  — preferred; anchors to the embedded "llvm-svn: <N>"      ║
+# ║       marker present in pre-migration commits, then adds git-only          ║
+# ║       commits on top.  Most accurate for full LLVM forks.                 ║
+# ║    B. Tag-relative — used when no SVN markers exist; counts all commits   ║
+# ║       up to the HEAD using the known base tag as an absolute anchor.      ║
+# ║    C. Total commit count — last-resort fallback.                          ║
+# ║                                                                           ║
+# ║  Source repository  : zrsx/llvm-project                                  ║
+# ║  Branches available : main (hybrid) · aosp · ollvm (upstream) · master   ║
+# ║  Reference tag      : llvmorg-22.1.8                                      ║
+# ║                                                                           ║
+# ║  PERMISSIONS: Read-only.  This workflow never writes to, tags, or        ║
+# ║  releases anything in the host repository.  It only reads the external   ║
+# ║  LLVM fork and uploads an Actions artifact within the run itself.        ║
+# ║                                                                           ║
+# ║  PORTABILITY: Self-contained and repository-agnostic.  Drop it into      ║
+# ║  any repo; configure via workflow_dispatch inputs or the env defaults.   ║
+# ║  No secrets required for public LLVM forks.                              ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+name: 🔢 AOSP LLVM Revision Calculator
 
 on:
+  # ── Manual trigger with full parameter control ───────────────────────────
   workflow_dispatch:
     inputs:
-      commit_hash:
-        description: 'LLVM Commit Hash or Tag (e.g., ca7933e)'
-        required: true
-        default: 'ca7933e'
+      llvm_repository:
+        description: >
+          Source LLVM repository in "owner/repo" format.
+          Must be publicly accessible (or supply LLVM_TOKEN secret for private repos).
+        required: false
+        default: 'zrsx/llvm-project'
+        type: string
 
+      target_branch:
+        description: >
+          Branch of the LLVM repository to evaluate.
+          main=hybrid, aosp=AOSP-only, ollvm=upstream, master=default.
+        required: false
+        default: 'main'
+        type: choice
+        options:
+          - main      # Hybrid: latest upstream + AOSP patches
+          - aosp      # AOSP-only branch
+          - ollvm     # Upstream LLVM (no AOSP patches)
+          - master    # Repository default branch
+
+      base_tag:
+        description: >
+          Upstream LLVM release tag used as the anchor for Strategy B.
+          Must exist in the source repository.
+        required: false
+        default: 'llvmorg-22.1.8'
+        type: string
+
+  # ── Auto: recalculate whenever this workflow file is updated ─────────────
+  push:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/aosp-llvm-revision.yml'
+
+  # ── Scheduled: every Monday at 04:00 UTC ─────────────────────────────────
+  schedule:
+    - cron: '0 4 * * 1'
+
+# Only one calculation runs per branch at a time
+concurrency:
+  group: aosp-llvm-revision-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read    # Read-only — this workflow never writes back to the repository
+
+# ── Workflow-level defaults (overridden by dispatch inputs when supplied) ──
+env:
+  LLVM_REPO:   ${{ inputs.llvm_repository || 'zrsx/llvm-project' }}
+  LLVM_BRANCH: ${{ inputs.target_branch   || 'main'              }}
+  LLVM_TAG:    ${{ inputs.base_tag        || 'llvmorg-22.1.8'    }}
+
+# ══════════════════════════════════════════════════════════════════════════
+#  JOB 1 · calculate
+#  Clones the LLVM fork and computes the AOSP revision number.
+# ══════════════════════════════════════════════════════════════════════════
 jobs:
-  calculate-r-number:
-    runs-on: ubuntu-latest
+  calculate:
+    name: 🧮 Calculate AOSP Revision
+    runs-on: ubuntu-24.04
+
+    outputs:
+      aosp_revision:   ${{ steps.compute.outputs.aosp_revision   }}
+      revision_number: ${{ steps.compute.outputs.revision_number }}
+      llvm_version:    ${{ steps.compute.outputs.llvm_version    }}
+      commit_sha:      ${{ steps.compute.outputs.commit_sha      }}
+      short_sha:       ${{ steps.compute.outputs.short_sha       }}
+      method:          ${{ steps.compute.outputs.method          }}
+
     steps:
-      - name: Fetch LLVM Metadata
+      # ── 1 · Validate inputs ──────────────────────────────────────────────
+      - name: 🔍 Validate and resolve configuration
+        id: cfg
+        shell: bash
         run: |
-          # We need main branch and the target commit
-          git clone --filter=blob:none --no-checkout https://github.com/zrsx/llvm-project.git llvm_metadata
-          cd llvm_metadata
-          git fetch origin main
-          git fetch origin ${{ github.event.inputs.commit_hash }}
+          set -euo pipefail
 
-      - name: Calculate Chronological R-Number
-        id: get_count
-        run: |
-          cd llvm_metadata
-          
-          # 1. Get the date of the target commit
-          COMMIT_DATE=$(git log -1 --format=%ct ${{ github.event.inputs.commit_hash }})
-          echo "Commit Date Timestamp: $COMMIT_DATE"
+          REPO="${{ env.LLVM_REPO }}"
+          BRANCH="${{ env.LLVM_BRANCH }}"
+          TAG="${{ env.LLVM_TAG }}"
 
-          # 2. Count commits on 'main' that happened BEFORE or AT this date
-          # This ensures the number grows over time regardless of branches
-          COUNT=$(git rev-list --count --before=$COMMIT_DATE origin/main)
-          
-          echo "R_NUMBER=r$COUNT" >> $GITHUB_ENV
-          echo "count=$COUNT" >> $GITHUB_OUTPUT
-          
-      - name: Post to Summary
+          # Enforce owner/repo format to catch typos early
+          if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Repository '$REPO' is not in 'owner/repo' format."
+            exit 1
+          fi
+
+          {
+            echo "repo=$REPO"
+            echo "branch=$BRANCH"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "::notice title=Configuration::Repo=$REPO | Branch=$BRANCH | BaseTag=$TAG | Trigger=${{ github.event_name }}"
+          echo ""
+          echo "  📦  Repository : $REPO"
+          echo "  🌿  Branch     : $BRANCH"
+          echo "  🏷️   Base tag   : $TAG"
+          echo "  ⚡  Trigger    : ${{ github.event_name }}"
+
+      # ── 2 · Clone LLVM (blobless, full depth) ───────────────────────────
+      # --filter=blob:none skips file content blobs but keeps the complete
+      # commit graph — ideal for large repos like LLVM (500k+ commits).
+      # --depth is intentionally omitted so git rev-list counts are accurate.
+      - name: 📥 Clone LLVM repository (blobless)
+        shell: bash
+        env:
+          # Supply a fine-grained PAT as LLVM_TOKEN for private forks
+          GIT_TOKEN: ${{ secrets.LLVM_TOKEN || '' }}
         run: |
-          echo "### 🚀 AOSP LLVM Revision (Chronological)" >> $GITHUB_STEP_SUMMARY
-          echo "This number represents the state of the 'main' branch when this release occurred." >> $GITHUB_STEP_SUMMARY
-          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Target Commit** | \`${{ github.event.inputs.commit_hash }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **AOSP Revision** | \`${{ env.R_NUMBER }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Use \`${{ env.R_NUMBER }}\` for your build to ensure it is seen as newer than r596125." >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+
+          REPO="${{ steps.cfg.outputs.repo }}"
+          BRANCH="${{ steps.cfg.outputs.branch }}"
+
+          if [[ -n "${GIT_TOKEN}" ]]; then
+            URL="https://x-access-token:${GIT_TOKEN}@github.com/${REPO}.git"
+            echo "  🔐  Authenticating with LLVM_TOKEN secret"
+          else
+            URL="https://github.com/${REPO}.git"
+            echo "  🌐  Cloning as anonymous (public repo)"
+          fi
+
+          echo "  ⬇️   Cloning ${REPO}  →  branch '${BRANCH}'"
+          echo ""
+
+          git clone \
+            --filter=blob:none \
+            --branch  "${BRANCH}" \
+            --single-branch \
+            "${URL}" \
+            llvm-project
+
+          cd llvm-project
+
+          echo "  🏷️   Fetching all tags..."
+          git fetch --tags --quiet origin
+
+          TOTAL=$(git rev-list --count HEAD)
+          HEAD_SHA=$(git rev-parse --short=12 HEAD)
+          echo ""
+          echo "  ✅  Clone complete"
+          echo "      HEAD    : ${HEAD_SHA}"
+          echo "      Commits : ${TOTAL}"
+
+      # ── 3 · Compute the AOSP revision number ────────────────────────────
+      - name: 🔢 Compute AOSP revision number
+        id: compute
+        working-directory: llvm-project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_TAG="${{ steps.cfg.outputs.tag }}"
+          COMMIT_SHA=$(git rev-parse HEAD)
+          SHORT_SHA=$(git rev-parse --short=12 HEAD)
+
+          echo ""
+          echo "┌─────────────────────────────────────────────────────────────┐"
+          echo "│        AOSP Revision — Strategy Selection                   │"
+          echo "└─────────────────────────────────────────────────────────────┘"
+
+          # ── Strategy A: SVN-embedded revision (preferred) ────────────────
+          #
+          # LLVM was hosted on SVN until 2019.  Every commit before the
+          # SVN→Git migration carries "llvm-svn: <N>" in its commit message.
+          # We find the most recent such commit with git's built-in --grep
+          # (fast; avoids iterating manually), read its SVN number, then
+          # count how many pure-git commits have landed on top of it.
+          #
+          #   AOSP revision = last_svn_number + pure_git_commits_above_it
+          #
+          echo "  [A] Searching for embedded 'llvm-svn:' marker in history..."
+          LAST_SVN_HASH=$(git log --grep="llvm-svn:" --format="%H" -1 2>/dev/null || true)
+
+          if [[ -n "${LAST_SVN_HASH}" ]]; then
+            SVN_REV=$(
+              git log -1 --format="%B" "${LAST_SVN_HASH}" \
+                | grep -oE 'llvm-svn: [0-9]+' \
+                | awk '{print $2}' \
+                | tail -1
+            )
+            GIT_EXTRA=$(git rev-list --count HEAD "^${LAST_SVN_HASH}")
+            REVISION_NUMBER=$(( SVN_REV + GIT_EXTRA ))
+            METHOD="Strategy A — SVN base r${SVN_REV} + ${GIT_EXTRA} git-only commits"
+
+            echo "  ✅  SVN anchor  : ${LAST_SVN_HASH:0:12}  (llvm-svn: ${SVN_REV})"
+            echo "  ➕  Git extras  : ${GIT_EXTRA} commit(s) on top"
+
+          # ── Strategy B: Commit count relative to base tag ────────────────
+          #
+          # No SVN markers — this is a pure-git fork.  Use the known
+          # upstream release tag as an absolute anchor: count all commits
+          # up to that tag, then add any commits beyond it.
+          #
+          elif git rev-parse --verify "refs/tags/${BASE_TAG}" &>/dev/null; then
+            echo "  ℹ️   No SVN markers — switching to Strategy B (tag-relative)..."
+            BASE_COMMIT=$(git rev-list -n1 "refs/tags/${BASE_TAG}")
+            COMMITS_AT_TAG=$(git rev-list --count "${BASE_COMMIT}")
+            COMMITS_AFTER=$(git rev-list  --count HEAD "^${BASE_COMMIT}")
+            REVISION_NUMBER=$(( COMMITS_AT_TAG + COMMITS_AFTER ))
+            METHOD="Strategy B — tag ${BASE_TAG} (commit #${COMMITS_AT_TAG}) + ${COMMITS_AFTER} newer commits"
+
+            echo "  ✅  Tag anchor  : ${BASE_TAG}  →  absolute commit #${COMMITS_AT_TAG}"
+            echo "  ➕  After tag   : ${COMMITS_AFTER} commit(s)"
+
+          # ── Strategy C: Total commit count (fallback) ────────────────────
+          #
+          # Neither SVN markers nor the base tag are present.  Fall back to
+          # the raw total commit count.  Less precise but always available.
+          #
+          else
+            echo "  ⚠️   Neither SVN markers nor tag '${BASE_TAG}' found."
+            echo "  [C] Falling back to total commit count..."
+            REVISION_NUMBER=$(git rev-list --count HEAD)
+            METHOD="Strategy C — total commit count (fallback)"
+
+            echo "  ✅  Total commits: ${REVISION_NUMBER}"
+          fi
+
+          AOSP_REVISION="r${REVISION_NUMBER}"
+          LLVM_VERSION=$(echo "${BASE_TAG}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+
+          # ── Emit job outputs ─────────────────────────────────────────────
+          {
+            echo "aosp_revision=${AOSP_REVISION}"
+            echo "revision_number=${REVISION_NUMBER}"
+            echo "llvm_version=${LLVM_VERSION}"
+            echo "commit_sha=${COMMIT_SHA}"
+            echo "short_sha=${SHORT_SHA}"
+            echo "method=${METHOD}"
+          } >> "$GITHUB_OUTPUT"
+
+          # ── Pretty-print result ──────────────────────────────────────────
+          echo ""
+          printf "╔══════════════════════════════════════════════════════════╗\n"
+          printf "║              AOSP LLVM Revision Result                  ║\n"
+          printf "╠══════════════════════════════════════════════════════════╣\n"
+          printf "║  Revision   :  %-40s║\n" "${AOSP_REVISION}"
+          printf "║  LLVM ver.  :  %-40s║\n" "${LLVM_VERSION}"
+          printf "║  Commit     :  %-40s║\n" "${SHORT_SHA}"
+          printf "║  Branch     :  %-40s║\n" "${{ steps.cfg.outputs.branch }}"
+          printf "║  Repo       :  %-40s║\n" "${{ steps.cfg.outputs.repo }}"
+          printf "╠══════════════════════════════════════════════════════════╣\n"
+          printf "║  Method     :  %-40s║\n" "${METHOD:0:40}"
+          printf "╚══════════════════════════════════════════════════════════╝\n"
+
+      # ── 4 · Generate machine-readable and human-readable reports ─────────
+      - name: 💾 Generate revision report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # --- revision.env: sourceable key=value pairs ---
+          {
+            echo "# AOSP LLVM Revision — generated by GitHub Actions"
+            echo "# Source this file to load all values into your shell environment"
+            echo "#   usage: source revision.env"
+            echo ""
+            echo "AOSP_LLVM_REVISION=${{ steps.compute.outputs.aosp_revision }}"
+            echo "REVISION_NUMBER=${{ steps.compute.outputs.revision_number }}"
+            echo "LLVM_VERSION=${{ steps.compute.outputs.llvm_version }}"
+            echo "COMMIT_SHA=${{ steps.compute.outputs.commit_sha }}"
+            echo "BRANCH=${{ steps.cfg.outputs.branch }}"
+            echo "REPOSITORY=${{ steps.cfg.outputs.repo }}"
+            echo "BASE_TAG=${{ steps.cfg.outputs.tag }}"
+            echo "CALCULATION_METHOD=\"${{ steps.compute.outputs.method }}\""
+            echo "CALCULATED_AT=${TIMESTAMP}"
+            echo "WORKFLOW_RUN=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > dist/revision.env
+
+          # --- revision.md: human-readable Markdown ---
+          {
+            echo "# AOSP LLVM Revision Report"
+            echo ""
+            echo "> Generated: \`${TIMESTAMP}\`"
+            echo ""
+            echo "## Result"
+            echo ""
+            echo "**\`${{ steps.compute.outputs.aosp_revision }}\`** — LLVM ${{ steps.compute.outputs.llvm_version }}"
+            echo ""
+            echo "## Details"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| **AOSP Revision** | \`${{ steps.compute.outputs.aosp_revision }}\` |"
+            echo "| **LLVM Version** | \`${{ steps.compute.outputs.llvm_version }}\` |"
+            echo "| **Commit SHA** | \`${{ steps.compute.outputs.commit_sha }}\` |"
+            echo "| **Branch** | \`${{ steps.cfg.outputs.branch }}\` |"
+            echo "| **Repository** | [\`${{ steps.cfg.outputs.repo }}\`](https://github.com/${{ steps.cfg.outputs.repo }}) |"
+            echo "| **Base Tag** | \`${{ steps.cfg.outputs.tag }}\` |"
+            echo "| **Calculation Method** | ${{ steps.compute.outputs.method }} |"
+            echo "| **Calculated At** | \`${TIMESTAMP}\` |"
+            echo "| **Workflow Run** | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+          } > dist/revision.md
+
+          echo "📄 dist/revision.env:"
+          cat dist/revision.env
+
+      # ── 5 · Upload artifacts (retained 90 days) ──────────────────────────
+      - name: 📤 Upload revision artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aosp-llvm-${{ steps.compute.outputs.aosp_revision }}-${{ steps.compute.outputs.short_sha }}
+          path: dist/
+          retention-days: 90
+          if-no-files-found: error
+
+      # ── 6 · Write GitHub Step Summary (always, even on failure) ──────────
+      - name: 📋 Write job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## 🔢 AOSP LLVM Revision Report"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| 🏷️ **AOSP Revision** | \`${{ steps.compute.outputs.aosp_revision }}\` |"
+            echo "| 📦 **LLVM Version** | \`${{ steps.compute.outputs.llvm_version }}\` |"
+            echo "| 🔗 **Commit** | \`${{ steps.compute.outputs.short_sha }}\` |"
+            echo "| 🌿 **Branch** | \`${{ steps.cfg.outputs.branch }}\` |"
+            echo "| 📁 **Repository** | [\`${{ steps.cfg.outputs.repo }}\`](https://github.com/${{ steps.cfg.outputs.repo }}) |"
+            echo "| 🏷️ **Base Tag** | \`${{ steps.cfg.outputs.tag }}\` |"
+            echo "| ⚙️ **Method** | ${{ steps.compute.outputs.method }} |"
+            echo ""
+            echo "> **Result:** LLVM \`${{ steps.compute.outputs.llvm_version }}\` — AOSP revision **\`${{ steps.compute.outputs.aosp_revision }}\`**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
