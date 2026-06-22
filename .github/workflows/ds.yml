@@ -15,7 +15,7 @@ jobs:
       - name: Fetch LLVM Metadata
         run: |
           # We need main branch and the target commit
-          git clone --filter=blob:none --no-checkout https://github.com/llvm/llvm-project.git llvm_metadata
+          git clone --filter=blob:none --no-checkout https://github.com/zrsx/llvm-project.git llvm_metadata
           cd llvm_metadata
           git fetch origin main
           git fetch origin ${{ github.event.inputs.commit_hash }}
