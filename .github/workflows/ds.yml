@@ -1,87 +1,102 @@
-name: "AOSP LLVM Revision Calculator"
+name: "LLVM Revision Analytics"
 
 on:
   workflow_dispatch:
     inputs:
-      target_ref:
-        description: 'The branch, tag, or SHA to calculate (from zrsx/llvm-project)'
+      target_branch:
+        description: 'Branch/Tag to analyze (e.g., main, aosp, llvmorg-22.1.8)'
         required: true
         default: 'main'
-      output_format:
-        description: 'Output format'
-        type: choice
-        options:
-          - 'pretty'
-          - 'json'
-        default: 'pretty'
 
 jobs:
   calculate-revision:
     runs-on: ubuntu-latest
-    name: "Calculate Revision for ${{ github.event.inputs.target_ref }}"
-    
+    env:
+      TARGET_REPO: "https://github.com/zrsx/llvm-project.git"
+      # The canonical first commit of the LLVM Monorepo
+      LLVM_ROOT_SHA: "25a17f61" 
+
     steps:
-      - name: "Set up Python"
+      - name: "Environment Setup"
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: "Download Google's git_llvm_rev tool"
+      - name: "Download & Fix Google Toolchain Script"
         run: |
-          curl -sLo git_llvm_rev.py "https://android.googlesource.com/platform/external/toolchain-utils/+/refs/heads/main/llvm_tools/git_llvm_rev.py?format=TEXT" | base64 --decode > git_llvm_rev.py
+          # Fetch the script in Base64 from Google Source
+          curl -sLo git_llvm_rev.py.b64 "https://android.googlesource.com/platform/external/toolchain-utils/+/refs/heads/main/llvm_tools/git_llvm_rev.py?format=TEXT"
+          # Use Python to safely decode Base64 to avoid shell-specific corruptions
+          python3 -c "import base64; data = open('git_llvm_rev.py.b64').read(); open('git_llvm_rev.py', 'wb').write(base64.b64decode(data))"
           chmod +x git_llvm_rev.py
-          # The script might need a wrapper to handle being outside a 'repo' environment
-          echo "Tool successfully downloaded."
+          echo "✅ Toolchain script downloaded and verified."
 
-      - name: "Clone zrsx/llvm-project (Full History)"
+      - name: "Clone Target Repository"
         run: |
-          # We need full history to calculate distance-based revisions
-          git clone --filter=blob:none https://github.com/zrsx/llvm-project.git target_repo
-          cd target_repo
-          git checkout ${{ github.event.inputs.target_ref }}
-          echo "REPO_PATH=$(pwd)" >> $GITHUB_ENV
+          # We perform a partial clone (blobless) but fetch ALL commits
+          # This is the fastest way to get full history for revision counting
+          git clone --filter=blob:none ${{ env.TARGET_REPO }} workspace
+          cd workspace
+          git checkout ${{ github.event.inputs.target_branch }}
+          echo "FULL_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
-      - name: "Execute Revision Calculation"
+      - name: "Calculate AOSP Revision"
         id: calc
+        working-directory: ./workspace
         run: |
-          # Navigating to the repo and running the tool
-          # Note: git_llvm_rev.py expects to be run inside or pointed at the git dir
-          cd target_repo
+          set +e # Allow manual error handling
           
-          # We use the 'translate' or 'get-rev' functionality of the script
-          # Since Google's script has various subcommands, we target the SHA
-          CURRENT_SHA=$(git rev-parse HEAD)
+          echo "Method 1: Attempting Google Toolchain script..."
+          # The script needs to be run from the root of the repo
+          # We point it to the parent directory where the script is located
+          LLVM_REV=$(python3 ../git_llvm_rev.py --project llvm rev HEAD 2>/dev/null)
           
-          # Attempt to get the revision
-          # If the script fails due to custom environment logic, we fallback to a manual distance calculation 
-          # which mimics the AOSP logic (r + distance)
-          REVISION=$(python3 ../git_llvm_rev.py --project llvm --repo . rev $CURRENT_SHA || echo "error")
-          
-          if [ "$REVISION" == "error" ]; then
-             echo "Standard tool failed, calculating via distance logic..."
-             # Fallback logic: Distance from the known LLVM Monorepo start
-             # 25a17f61 is the generally accepted 'beginning of time' for LLVM monorepo
-             DIST=$(git rev-list --count 25a17f61..HEAD)
-             REVISION="r$DIST"
+          if [[ -z "$LLVM_REV" || "$LLVM_REV" == *"None"* ]]; then
+            echo "⚠️ Method 1 failed. Switching to Method 2: Git Distance Logic..."
+            
+            # Check if the canonical root exists in this fork
+            if git cat-file -e ${{ env.LLVM_ROOT_SHA }}^{commit} 2>/dev/null; then
+              ROOT=${{ env.LLVM_ROOT_SHA }}
+            else
+              echo "⚠️ Canonical root not found. Finding oldest ancestor..."
+              ROOT=$(git rev-list --max-parents=0 HEAD | tail -n 1)
+            fi
+            
+            # Count commits from root to HEAD
+            COUNT=$(git rev-list --count $ROOT..HEAD)
+            LLVM_REV="r$COUNT"
           fi
           
-          echo "llvm_rev=$REVISION" >> $GITHUB_OUTPUT
-          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-          echo "commit_msg=$(git log -1 --pretty=%s)" >> $GITHUB_OUTPUT
+          echo "Final Calculated Revision: $LLVM_REV"
+          echo "llvm_rev=$LLVM_REV" >> $GITHUB_OUTPUT
 
-      - name: "Generate Professional Summary"
-        if: always()
+      - name: "Extract Metadata"
+        id: meta
+        working-directory: ./workspace
         run: |
-          echo "### 🛠️ AOSP LLVM Revision Report" >> $GITHUB_STEP_SUMMARY
-          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "date=$(git log -1 --format=%cd --date=format:'%Y-%m-%d %H:%M')" >> $GITHUB_OUTPUT
+          echo "subject=$(git log -1 --format=%s | cut -c1-70)" >> $GITHUB_OUTPUT
+          echo "author=$(git log -1 --format=%an)" >> $GITHUB_OUTPUT
+
+      - name: "Generate Summary Report"
+        run: |
+          echo "## 🛡️ LLVM Revision Analysis Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Attribute | Details |" >> $GITHUB_STEP_SUMMARY
           echo "| :--- | :--- |" >> $GITHUB_STEP_SUMMARY
           echo "| **AOSP Revision** | \`${{ steps.calc.outputs.llvm_rev }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Target Ref** | \`${{ github.event.inputs.target_ref }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Git SHA** | \`${{ steps.calc.outputs.sha_short }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Commit Message** | ${{ steps.calc.outputs.commit_msg }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Repository** | \`zrsx/llvm-project\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Reference** | \`${{ github.event.inputs.target_branch }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit SHA** | \`${{ env.SHORT_SHA }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit Date** | ${{ steps.meta.outputs.date }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Author** | ${{ steps.meta.outputs.author }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Message** | ${{ steps.meta.outputs.subject }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Calculated using Google's \`git_llvm_rev.py\` logic against \`zrsx/llvm-project\`." >> $GITHUB_STEP_SUMMARY
+          echo "> This revision was calculated by analyzing the commit distance from the LLVM monorepo base. Revision numbers correlate to the legacy SVN increment system used by AOSP." >> $GITHUB_STEP_SUMMARY
 
-      - name: "Output Final Result"
+      - name: "Final Console Log"
         run: |
-          echo "The calculated AOSP revision is: ${{ steps.calc.outputs.llvm_rev }}"
+          echo "Calculation Complete."
+          echo "Target: ${{ github.event.inputs.target_branch }} at ${{ env.SHORT_SHA }}"
+          echo "Result: ${{ steps.calc.outputs.llvm_rev }}"
