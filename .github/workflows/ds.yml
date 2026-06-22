@@ -1,4 +1,4 @@
-name: Calculate AOSP LLVM Revision
+name: Calculate AOSP LLVM Revision (Corrected)
 
 on:
   workflow_dispatch:
@@ -12,36 +12,37 @@ jobs:
   calculate-r-number:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch LLVM History (Metadata Only)
+      - name: Fetch LLVM Metadata
         run: |
-          # Use --filter=blob:none to get history without downloading the actual code/files
+          # We need main branch and the target commit
           git clone --filter=blob:none --no-checkout https://github.com/llvm/llvm-project.git llvm_metadata
           cd llvm_metadata
-          # Fetch the specific commit to ensure it's in the local history
+          git fetch origin main
           git fetch origin ${{ github.event.inputs.commit_hash }}
 
-      - name: Calculate Count
+      - name: Calculate Chronological R-Number
         id: get_count
         run: |
           cd llvm_metadata
-          # Count all commits from the beginning of time to the target hash
-          COUNT=$(git rev-list --count ${{ github.event.inputs.commit_hash }})
+          
+          # 1. Get the date of the target commit
+          COMMIT_DATE=$(git log -1 --format=%ct ${{ github.event.inputs.commit_hash }})
+          echo "Commit Date Timestamp: $COMMIT_DATE"
+
+          # 2. Count commits on 'main' that happened BEFORE or AT this date
+          # This ensures the number grows over time regardless of branches
+          COUNT=$(git rev-list --count --before=$COMMIT_DATE origin/main)
+          
           echo "R_NUMBER=r$COUNT" >> $GITHUB_ENV
           echo "count=$COUNT" >> $GITHUB_OUTPUT
           
-      - name: Display Result
-        run: |
-          echo "--------------------------------------------------"
-          echo "Target Commit: ${{ github.event.inputs.commit_hash }}"
-          echo "AOSP Revision: ${{ env.R_NUMBER }}"
-          echo "--------------------------------------------------"
-
       - name: Post to Summary
         run: |
-          echo "### 🚀 AOSP LLVM Revision Calculated" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 AOSP LLVM Revision (Chronological)" >> $GITHUB_STEP_SUMMARY
+          echo "This number represents the state of the 'main' branch when this release occurred." >> $GITHUB_STEP_SUMMARY
           echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
           echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Commit Hash** | \`${{ github.event.inputs.commit_hash }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Target Commit** | \`${{ github.event.inputs.commit_hash }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **AOSP Revision** | \`${{ env.R_NUMBER }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Use this value for \`_svn_revision\` in \`android_version.py\`" >> $GITHUB_STEP_SUMMARY
+          echo "Use \`${{ env.R_NUMBER }}\` for your build to ensure it is seen as newer than r596125." >> $GITHUB_STEP_SUMMARY
